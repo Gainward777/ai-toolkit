@@ -12,6 +12,7 @@ import traceback
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -1716,6 +1717,8 @@ class LatentCachingFileItemDTOMixin:
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
         self._cached_audio_latent: Union[torch.Tensor, None] = None
+        # Optional: for models that condition on a paired control image (e.g. Flux-Kontext)
+        self._cached_control_latent: Union[torch.Tensor, None] = None
         self._latent_path: Union[str, None] = None
         self.is_latent_cached = False
         self.is_caching_to_disk = False
@@ -1753,6 +1756,15 @@ class LatentCachingFileItemDTOMixin:
                 item["audio_normalize"] = True
             if self.dataset_config.audio_preserve_pitch:
                 item["audio_preserve_pitch"] = True
+
+        # Control-latent cache invalidation (only affects datasets that have control images)
+        # We include these fields only when control_path exists so we don't invalidate caches for non-control datasets.
+        if hasattr(self, "control_path") and self.control_path is not None:
+            item["control_path"] = self.control_path
+            item["full_size_control_images"] = bool(getattr(self.dataset_config, "full_size_control_images", False))
+            if hasattr(self.dataset_config, "control_transparent_color"):
+                item["control_transparent_color"] = list(self.dataset_config.control_transparent_color)
+            item["control_latent_version"] = 1
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1779,6 +1791,7 @@ class LatentCachingFileItemDTOMixin:
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
                 self._cached_audio_latent = None
+                self._cached_control_latent = None
             else:
                 # move it back to cpu
                 self._encoded_latent = self._encoded_latent.to('cpu')
@@ -1786,6 +1799,8 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
                 if self._cached_audio_latent is not None:
                     self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+                if self._cached_control_latent is not None:
+                    self._cached_control_latent = self._cached_control_latent.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1802,6 +1817,8 @@ class LatentCachingFileItemDTOMixin:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
+            if 'control_latent' in state_dict:
+                self._cached_control_latent = state_dict['control_latent']
         return self._encoded_latent
 
 
@@ -1859,6 +1876,8 @@ class LatentCachingMixin:
                             file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
                         if 'audio_latent' in state_dict:
                             file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        if 'control_latent' in state_dict:
+                            file_item._cached_control_latent = state_dict['control_latent'].to('cpu', dtype=self.sd.torch_dtype)
                 else:
                     # not saved to disk, calculate
                     # load the image first
@@ -1868,6 +1887,7 @@ class LatentCachingMixin:
                     state_dict = OrderedDict()
                     first_frame_latent = None
                     audio_latent = None
+                    control_latent = None
                     # add batch dimension
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
@@ -1878,6 +1898,39 @@ class LatentCachingMixin:
                         print_acc(f"Error processing image: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
                         raise e
+
+                    # Optional: cache control_latent for paired-control models (e.g. Flux-Kontext).
+                    # This avoids doing VAE-encode of the control image during every training step.
+                    if hasattr(file_item, "control_path") and file_item.control_path is not None:
+                        try:
+                            file_item.load_control_image()
+                            if getattr(file_item, "control_tensor", None) is not None:
+                                ctrl = file_item.control_tensor
+                                # ctrl can be (C,H,W) or (N,C,H,W). We only support single control image for latent caching.
+                                if ctrl.ndim == 3:
+                                    ctrl = ctrl.unsqueeze(0)
+                                elif ctrl.ndim == 4:
+                                    if ctrl.shape[0] != 1:
+                                        # pick the first control image to keep cache format stable
+                                        ctrl = ctrl[:1]
+                                else:
+                                    raise ValueError(f"Unexpected control tensor shape {ctrl.shape} for {file_item.path}")
+
+                                # Match training behavior: control images are stored 0..1, model expects -1..1
+                                ctrl = ctrl * 2 - 1
+                                # Resize to the training crop if needed
+                                target_h, target_w = file_item.crop_height, file_item.crop_width
+                                if ctrl.shape[-2] != target_h or ctrl.shape[-1] != target_w:
+                                    ctrl = F.interpolate(ctrl, size=(target_h, target_w), mode='bilinear')
+
+                                ctrl = ctrl.to(self.sd.vae_device_torch, dtype=self.sd.torch_dtype)
+                                control_latent = self.sd.encode_images(ctrl).squeeze(0).to(latent.device, latent.dtype)
+                                if to_disk:
+                                    state_dict['control_latent'] = control_latent.clone().detach().cpu()
+                        except Exception as e:
+                            print_acc(f"Error processing control image for: {file_item.path}")
+                            print_acc(f"Error: {str(e)}")
+                            raise e
                     # do first frame
                     if self.dataset_config.num_frames > 1 and self.dataset_config.do_i2v:
                         frames = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
@@ -1911,9 +1964,13 @@ class LatentCachingMixin:
                             file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
                         if audio_latent is not None:
                             file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+                        if control_latent is not None:
+                            file_item._cached_control_latent = control_latent.to('cpu', dtype=self.sd.torch_dtype)
 
                     del imgs
                     del latent
+                    if control_latent is not None:
+                        del control_latent
                     del file_item.tensor
                     file_item.cleanup()
 

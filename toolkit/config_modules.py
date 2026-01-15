@@ -219,6 +219,11 @@ class NetworkConfig:
         # start from a pretrained lora
         self.pretrained_lora_path = kwargs.get('pretrained_lora_path', None)
 
+        # Dtype to keep the trainable network weights in (primarily affects LoRA/LoKR/etc).
+        # Default is fp32 for stability. For low-VRAM you may set "bf16" or "float16".
+        # Note: this is the dtype of the *network weights*, not the base model.
+        self.lora_weight_dtype: str = kwargs.get('lora_weight_dtype', 'float32')
+
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
 

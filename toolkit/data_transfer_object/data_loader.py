@@ -167,6 +167,8 @@ class DataLoaderBatchDTO:
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
+            # Optional: control latents cached alongside normal latents (e.g. Flux-Kontext)
+            self.control_latents: Union[torch.Tensor, None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
             self.mask_tensor: Union[torch.Tensor, None] = None
             self.unaugmented_tensor: Union[torch.Tensor, None] = None
@@ -207,6 +209,20 @@ class DataLoaderBatchDTO:
                 self.latents = torch.cat(
                     [x.get_latent().unsqueeze(0) for x in self.file_items]
                 )
+                # control latents (if present in cache)
+                if any([getattr(x, "_cached_control_latent", None) is not None for x in self.file_items]):
+                    base_ctrl = None
+                    for x in self.file_items:
+                        if getattr(x, "_cached_control_latent", None) is not None:
+                            base_ctrl = x._cached_control_latent
+                            break
+                    ctrl_list = []
+                    for x in self.file_items:
+                        if getattr(x, "_cached_control_latent", None) is None:
+                            ctrl_list.append(torch.zeros_like(base_ctrl))
+                        else:
+                            ctrl_list.append(x._cached_control_latent)
+                    self.control_latents = torch.cat([t.unsqueeze(0) for t in ctrl_list])
                 if any(
                     [x._cached_first_frame_latent is not None for x in self.file_items]
                 ):
